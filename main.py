@@ -1,8 +1,11 @@
 import os
-from fastapi import FastAPI
+from typing import Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from database import db, create_document, get_documents
 
-app = FastAPI()
+app = FastAPI(title="BSSM Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,60 +15,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Startup bootstrap: create demo accounts if empty ---
+@app.on_event("startup")
+def bootstrap_accounts():
+    if db is None:
+        return
+    try:
+        if db["account"].count_documents({}) == 0:
+            db["account"].insert_many([
+                {"nik": "1111111111111111", "name": "Warga Demo", "role": "warga", "password": "demo123", "active": True},
+                {"nik": "2222222222222222", "name": "Pengurus Demo", "role": "pengurus", "password": "demo123", "active": True},
+                {"nik": "9999999999999999", "name": "Admin Demo", "role": "admin", "password": "demo123", "active": True},
+            ])
+            db["account"].create_index("nik", unique=True)
+    except Exception:
+        # silent fail in bootstrap to avoid breaking server
+        pass
+
+class LoginRequest(BaseModel):
+    nik: str
+    password: str
+
+class LoginResponse(BaseModel):
+    nik: str
+    name: str
+    role: str
+    token: str
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
-
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+    return {"message": "BSSM Backend Running"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
+    status = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            status["database"] = "✅ Connected"
+            status["collections"] = db.list_collection_names()
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
+        status["database"] = f"⚠️ {str(e)[:80]}"
+    return status
 
+@app.post("/auth/login", response_model=LoginResponse)
+def login(payload: LoginRequest):
+    # Simple credential check from DB (Account collection)
+    try:
+        user = db["account"].find_one({"nik": payload.nik, "password": payload.password, "active": True})
+    except Exception:
+        raise HTTPException(status_code=500, detail="Database connection error")
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    if not user:
+        raise HTTPException(status_code=401, detail="NIK atau kata sandi salah")
+
+    token = f"demo-{user['_id']}"  # demo token
+    return {"nik": user["nik"], "name": user["name"], "role": user["role"], "token": token}
+
+class TransactionIn(BaseModel):
+    date: str
+    customer: str
+    material: str
+    weight: float
+    price: float
+
+class TransactionOut(TransactionIn):
+    total: float
+
+@app.post("/transactions", response_model=TransactionOut)
+def create_transaction(data: TransactionIn):
+    total = float(data.weight) * float(data.price)
+    doc = data.dict()
+    doc["total"] = total
+    _id = create_document("transaction", doc)
+    doc["_id"] = _id
+    return doc
+
+@app.get("/transactions")
+def list_transactions(limit: Optional[int] = 200):
+    docs = get_documents("transaction", {}, limit)
+    # Normalize
+    for d in docs:
+        d["_id"] = str(d.get("_id"))
+    return docs
